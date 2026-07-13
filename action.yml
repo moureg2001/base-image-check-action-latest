@@ -1,4 +1,4 @@
-name: 'Base Image Check'
+name: 'Base Image Check Latest'
 description: |
   Checks if Docker base images have been updated (same tag, new SHA).
   Compares previous digests (stored as labels in the app image) against
@@ -194,7 +194,8 @@ runs:
           INDEX=$((INDEX + 1))
         done <<< "$IMAGES"
 
-        echo "stages=${STAGES}" >> $GITHUB_OUTPUT
+        STAGES_COMPACT=$(echo "$STAGES" | jq -c '.')
+        echo "stages=${STAGES_COMPACT}" >> $GITHUB_OUTPUT
         echo "stage_count=${STAGE_COUNT}" >> $GITHUB_OUTPUT
 
     # =========================================================================
