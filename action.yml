@@ -1,0 +1,274 @@
+name: 'Base Image Check'
+description: |
+  Checks if Docker base images have been updated (same tag, new SHA).
+  Compares previous digests (stored as labels in the app image) against
+  current registry digests. Supports any number of FROM stages, private
+  registries, webhook notifications, and automatic Dockerfile detection.
+author: 'ADEBAR-DevOps'
+
+inputs:
+  app-image:
+    description: 'Full path to the current app image (for reading previous digest labels)'
+    required: true
+  app-image-tag:
+    description: 'Tag of the app image to read previous labels from'
+    required: false
+    default: 'latest'
+  dockerfile:
+    description: 'Path to the Dockerfile. Set to "auto" to auto-detect.'
+    required: false
+    default: 'Dockerfile'
+
+  # Optional: private registry login (for pulling the app image)
+  registry:
+    description: 'Registry to authenticate against before pulling app image'
+    required: false
+    default: ''
+  registry-username:
+    description: 'Registry username'
+    required: false
+    default: ''
+  registry-password:
+    description: 'Registry password'
+    required: false
+    default: ''
+
+  # Optional: webhook notification on change
+  notify-webhook:
+    description: 'Webhook URL for notifications (only sent when base image changed)'
+    required: false
+    default: ''
+  notify-title:
+    description: 'Title for the webhook notification'
+    required: false
+    default: 'Base Image Update Detected'
+
+outputs:
+  changed:
+    description: 'Whether any base image digest has changed (true/false)'
+    value: ${{ steps.check.outputs.changed }}
+  stages:
+    description: 'JSON array with all stage details (image, old/new digest, status)'
+    value: ${{ steps.check.outputs.stages }}
+  stage-count:
+    description: 'Number of FROM stages found in the Dockerfile'
+    value: ${{ steps.new.outputs.stage_count }}
+  dockerfile-path:
+    description: 'Resolved path to the Dockerfile that was used'
+    value: ${{ steps.find-dockerfile.outputs.path }}
+
+runs:
+  using: 'composite'
+  steps:
+
+    # =========================================================================
+    # Step 0: Find the Dockerfile
+    # =========================================================================
+    - name: Find Dockerfile
+      id: find-dockerfile
+      shell: bash
+      run: |
+        set -euo pipefail
+        INPUT_PATH="${{ inputs.dockerfile }}"
+
+        if [ "${INPUT_PATH}" = "auto" ]; then
+          # Auto-detect: find Dockerfile in repo root, then search deeper
+          FOUND=$(find . -maxdepth 3 -name 'Dockerfile' -not -path './.git/*' | head -1)
+          if [ -z "$FOUND" ]; then
+            echo "::error::No Dockerfile found in repository"
+            exit 1
+          fi
+          echo "Auto-detected Dockerfile: ${FOUND}"
+          echo "path=${FOUND}" >> $GITHUB_OUTPUT
+        else
+          if [ ! -f "${INPUT_PATH}" ]; then
+            echo "::error::Dockerfile not found at: ${INPUT_PATH}"
+            exit 1
+          fi
+          echo "path=${INPUT_PATH}" >> $GITHUB_OUTPUT
+        fi
+
+    # =========================================================================
+    # Step 1: Optional registry login (for pulling the app image)
+    # =========================================================================
+    - name: Login to registry
+      if: inputs.registry != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "${{ inputs.registry-password }}" | docker login "${{ inputs.registry }}" \
+          -u "${{ inputs.registry-username }}" --password-stdin
+
+    # =========================================================================
+    # Step 2: Read previous digests from app image labels
+    # =========================================================================
+    - name: Get previous base image digests
+      id: old
+      shell: bash
+      run: |
+        set -euo pipefail
+        APP_IMAGE="${{ inputs.app-image }}:${{ inputs.app-image-tag }}"
+
+        # Try to pull the app image; if it doesn't exist yet, all labels will be empty
+        OLD_LABELS="{}"
+        if docker pull "${APP_IMAGE}" 2>/dev/null; then
+          OLD_LABELS=$(docker inspect "${APP_IMAGE}" --format '{{ json .Config.Labels }}' 2>/dev/null || echo '{}')
+        fi
+        echo "labels=${OLD_LABELS}" >> $GITHUB_OUTPUT
+        echo "Previous labels loaded"
+
+    # =========================================================================
+    # Step 3: Read current digests from registry (metadata only, no layer download)
+    # Dynamically detects ALL FROM lines in the Dockerfile
+    # =========================================================================
+    - name: Get current base image digests
+      id: new
+      shell: bash
+      run: |
+        set -euo pipefail
+        DOCKERFILE="${{ steps.find-dockerfile.outputs.path }}"
+        OLD_LABELS='${{ steps.old.outputs.labels }}'
+
+        # Parse ALL FROM lines from the Dockerfile
+        # Extract image name (skip "AS alias" part)
+        IMAGES=$(awk 'toupper($1)=="FROM" {print $2}' "${DOCKERFILE}" | tr -d '\r')
+        STAGE_COUNT=$(echo "$IMAGES" | wc -l | tr -d ' ')
+
+        echo "Found ${STAGE_COUNT} FROM stage(s) in ${DOCKERFILE}"
+
+        # Function to get digest from registry (metadata only)
+        get_digest() {
+          docker manifest inspect "$1" -v 2>/dev/null \
+            | jq -r 'if type=="array" then .[0].Descriptor.digest else .Descriptor.digest end'
+        }
+
+        # Function to read a label value from the previous app image
+        get_old_label() {
+          echo "${OLD_LABELS}" | jq -r --arg key "$1" '.[$key] // "none"'
+        }
+
+        # Build JSON array of all stages
+        STAGES="[]"
+        INDEX=0
+        while IFS= read -r IMAGE; do
+          [ -z "$IMAGE" ] && continue
+
+          # Determine stage name
+          if [ $INDEX -eq 0 ] && [ "$STAGE_COUNT" -gt 1 ]; then
+            STAGE_NAME="builder"
+          elif [ $INDEX -eq $((STAGE_COUNT - 1)) ] && [ "$STAGE_COUNT" -gt 1 ]; then
+            STAGE_NAME="runtime"
+          elif [ "$STAGE_COUNT" -eq 1 ]; then
+            STAGE_NAME="main"
+          else
+            STAGE_NAME="stage-${INDEX}"
+          fi
+
+          # Get current digest from registry
+          NEW_DIGEST=$(get_digest "$IMAGE")
+
+          # Get previous digest from app image label
+          OLD_DIGEST=$(get_old_label "base.${STAGE_NAME}.digest")
+
+          # Determine status
+          if [ "$OLD_DIGEST" = "none" ]; then
+            STATUS="first build"
+          elif [ "$OLD_DIGEST" = "$NEW_DIGEST" ]; then
+            STATUS="unchanged"
+          else
+            STATUS="new"
+          fi
+
+          echo "Stage ${INDEX} (${STAGE_NAME}): ${IMAGE} | old: ${OLD_DIGEST} | new: ${NEW_DIGEST} | ${STATUS}"
+
+          # Append to JSON array
+          STAGES=$(echo "$STAGES" | jq \
+            --arg name "$STAGE_NAME" \
+            --arg image "$IMAGE" \
+            --arg old "$OLD_DIGEST" \
+            --arg new "$NEW_DIGEST" \
+            --arg status "$STATUS" \
+            --argjson index "$INDEX" \
+            '. + [{"index": $index, "name": $name, "image": $image, "old_digest": $old, "new_digest": $new, "status": $status}]')
+
+          INDEX=$((INDEX + 1))
+        done <<< "$IMAGES"
+
+        echo "stages=${STAGES}" >> $GITHUB_OUTPUT
+        echo "stage_count=${STAGE_COUNT}" >> $GITHUB_OUTPUT
+
+    # =========================================================================
+    # Step 4: Compare — changed if ANY stage has a new digest
+    # =========================================================================
+    - name: Check if rebuild is needed
+      id: check
+      shell: bash
+      run: |
+        set -euo pipefail
+        STAGES='${{ steps.new.outputs.stages }}'
+
+        # Check if any stage has status "new" or "first build"
+        CHANGED=$(echo "$STAGES" | jq -r '[.[] | select(.status != "unchanged")] | if length > 0 then "true" else "false" end')
+
+        echo "changed=${CHANGED}" >> $GITHUB_OUTPUT
+        echo "stages=${STAGES}" >> $GITHUB_OUTPUT
+        echo "Rebuild needed: ${CHANGED}"
+
+    # =========================================================================
+    # Step 5: Generate summary table (works with any number of stages)
+    # =========================================================================
+    - name: Write summary
+      shell: bash
+      run: |
+        set -euo pipefail
+        STAGES='${{ steps.new.outputs.stages }}'
+        CHANGED="${{ steps.check.outputs.changed }}"
+        DOCKERFILE="${{ steps.find-dockerfile.outputs.path }}"
+
+        {
+          echo "## Base Image Update Summary"
+          echo ""
+          echo "**Dockerfile:** \`${DOCKERFILE}\`"
+          echo ""
+          echo "| # | Stage | Image | Previous Digest | Current Digest | Status |"
+          echo "|---|---|---|---|---|---|"
+
+          echo "$STAGES" | jq -r '.[] |
+            "| \(.index) | \(.name) | `\(.image)` | `\(.old_digest)` | `\(.new_digest)` | \(if .status == "new" then "**NEW**" elif .status == "first build" then "first build" else "unchanged" end) |"'
+
+          echo ""
+          if [ "$CHANGED" = "true" ]; then
+            echo "**Result:** New base image detected — rebuild recommended"
+          else
+            echo "**Result:** No new image — unchanged, no rebuild needed"
+          fi
+        } >> $GITHUB_STEP_SUMMARY
+
+    # =========================================================================
+    # Step 6: Optional webhook notification (only when changed)
+    # =========================================================================
+    - name: Send webhook notification
+      if: steps.check.outputs.changed == 'true' && inputs.notify-webhook != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        STAGES='${{ steps.new.outputs.stages }}'
+        TITLE="${{ inputs.notify-title }}"
+        APP_IMAGE="${{ inputs.app-image }}"
+
+        # Build a readable message from the stages JSON
+        CHANGES=$(echo "$STAGES" | jq -r '.[] | select(.status != "unchanged") | "- \(.name): \(.image) → \(.new_digest | .[0:19])..."')
+
+        PAYLOAD=$(jq -n \
+          --arg title "$TITLE" \
+          --arg app "$APP_IMAGE" \
+          --arg changes "$CHANGES" \
+          '{
+            text: ($title + "\n\nApp: " + $app + "\n\nChanged stages:\n" + $changes)
+          }')
+
+        curl -s -X POST "${{ inputs.notify-webhook }}" \
+          -H "Content-Type: application/json" \
+          -d "$PAYLOAD" || echo "::warning::Webhook notification failed"
+
+        echo "Notification sent to webhook"
