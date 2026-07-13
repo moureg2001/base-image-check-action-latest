@@ -1,0 +1,1 @@
+# base-image-check-action-latest
